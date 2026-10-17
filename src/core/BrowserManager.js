@@ -238,6 +238,7 @@ class BrowserManager {
         if (data.closing) return await data.closing;
         data.closing = (async () => {
             try {
+                await this._updateAuthFile(authIndex);
                 await data.context.close();
             } finally {
                 if (this.temporaryContexts.get(authIndex) === data) this.temporaryContexts.delete(authIndex);
@@ -675,7 +676,7 @@ class BrowserManager {
      */
     async _updateAuthFile(authIndex) {
         // Retrieve the target account's context from the multi-context Map to avoid cross-contamination of auth data by using this.context
-        const contextData = this.contexts.get(authIndex);
+        const contextData = this.contexts.get(authIndex) || this.temporaryContexts.get(authIndex);
         if (!contextData || !contextData.context) return;
 
         // Check availability of auto-update feature from config
