@@ -277,7 +277,9 @@ class BrowserManager {
                                 waitFor: [...this.contexts.keys()],
                             };
                         }
-                        await this.closeContext(idle);
+                        if ((await this.closeContext(idle, { onlyIfIdle: true })) === false) {
+                            return { temporary: [], waitFor: [idle] };
+                        }
                     }
                     signal?.throwIfAborted();
                     const storageState = this.authSource.getAuth(authIndex);
@@ -1851,7 +1853,9 @@ class BrowserManager {
         }
 
         this.pendingContextClosures.delete(authIndex);
-        await this.closeContext(authIndex);
+        if ((await this.closeContext(authIndex, { onlyIfIdle: true })) === false) {
+            return this._scheduleContextClosureWhenIdle(authIndex, reason);
+        }
         return true;
     }
 
@@ -2869,12 +2873,14 @@ class BrowserManager {
      *
      * @param {number} authIndex - The auth index to close
      */
-    async closeContext(authIndex) {
+    async closeContext(authIndex, { onlyIfIdle = false } = {}) {
         const existing = this.closingContexts.get(authIndex);
         if (existing) return await existing;
         const closing = (async () => {
             await this.waitForContextLeases(authIndex);
+            if (onlyIfIdle && this._hasActiveQueueForAuth(authIndex)) return false;
             await this._closeContextNow(authIndex);
+            return true;
         })();
         this.closingContexts.set(authIndex, closing);
         try {
