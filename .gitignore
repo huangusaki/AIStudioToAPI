@@ -40,3 +40,4 @@ debug_*.png
 debug_*.html
 proxylist.txt
 proxy_mapping.json
+docs/project.md
