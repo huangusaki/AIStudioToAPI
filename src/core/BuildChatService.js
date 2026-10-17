@@ -1,4 +1,6 @@
 const { randomUUID } = require("crypto");
+const fs = require("fs");
+const path = require("path");
 const { extractSnapshots } = require("./BuildProtocol");
 
 const MODEL = "gemini-4-argon";
@@ -39,16 +41,46 @@ class BuildChatService {
     constructor(system) {
         this.system = system;
         this.busy = false;
-        this.account = (process.env.BUILD_ACCOUNT_EMAIL || "").trim().toLowerCase();
-        this.appUrl = process.env.BUILD_APP_URL || "";
+        this.authIndex = null;
+        this.uses = 0;
+        this.draftsFile = path.join(process.cwd(), "data", "build-drafts.json");
+        this.drafts = fs.existsSync(this.draftsFile) ? JSON.parse(fs.readFileSync(this.draftsFile, "utf8")) : {};
         this.timeoutMs = system.config.fakeStreamTimeoutMs;
-        if (this.appUrl && !/^https:\/\/aistudio\.google\.com\/apps\/[a-zA-Z0-9-]+(?:\?[^#]*)?$/.test(this.appUrl)) {
-            throw new Error("BUILD_APP_URL must be an https://aistudio.google.com/apps/<id> URL");
-        }
     }
 
     get enabled() {
-        return Boolean(this.account && this.appUrl);
+        return this.system.authSource.getRotationIndices().length > 0;
+    }
+
+    selectAccount() {
+        const accounts = this.system.authSource.getRotationIndices();
+        if (!accounts.length) throw failure(503, "No valid account credentials are available");
+        if (!accounts.includes(this.authIndex)) {
+            const current = this.system.browserManager.currentAuthIndex;
+            this.authIndex = accounts.includes(current) ? current : accounts[0];
+            this.uses = 0;
+        }
+        return this.authIndex;
+    }
+
+    advanceAccount(authIndex) {
+        const accounts = this.system.authSource.getRotationIndices();
+        this.authIndex = accounts[(accounts.indexOf(authIndex) + 1) % accounts.length] ?? null;
+        this.uses = 0;
+    }
+
+    accountKey(authIndex) {
+        return this.system.authSource.accountNameMap.get(authIndex)?.trim().toLowerCase() || `auth-${authIndex}`;
+    }
+
+    async saveDraft(accountKey, appId) {
+        if (typeof appId !== "string" || !/^[a-zA-Z0-9-]+$/.test(appId)) {
+            throw new Error("Build did not return a valid draft ID");
+        }
+        this.drafts[accountKey] = `https://aistudio.google.com/apps/${appId}?showPreview=true&showAssistant=true`;
+        await fs.promises.mkdir(path.dirname(this.draftsFile), { recursive: true });
+        await fs.promises.writeFile(`${this.draftsFile}.tmp`, JSON.stringify(this.drafts, null, 2), { mode: 0o600 });
+        await fs.promises.rename(`${this.draftsFile}.tmp`, this.draftsFile);
     }
 
     matches(req) {
@@ -56,28 +88,41 @@ class BuildChatService {
         return typeof model === "string" && model.replace(/^models\//, "") === MODEL;
     }
 
-    async preparePage(page) {
+    async preparePage(page, appUrl) {
         this.stage = "open-draft";
         page.setDefaultTimeout(20000);
-        await page.goto(this.appUrl, { timeout: 60000, waitUntil: "domcontentloaded" });
+        const newDraft = !appUrl;
+        await page.goto(appUrl || "https://aistudio.google.com/apps", {
+            timeout: 60000,
+            waitUntil: "domcontentloaded",
+        });
         await page
-            .getByRole("textbox", { exact: true, name: "Make changes, add new features, ask for anything" })
+            .getByRole("textbox", {
+                exact: true,
+                name: newDraft
+                    ? "Describe an app and let Gemini do the rest"
+                    : "Make changes, add new features, ask for anything",
+            })
             .waitFor({ timeout: 60000 });
         const tour = page.getByRole("button", { name: /^(关闭导览|Close tour)$/ });
         await tour.waitFor({ state: "visible", timeout: 5000 }).catch(() => {});
         if (await tour.isVisible()) await tour.click();
         this.stage = "select-model";
-        await page.getByRole("button", { name: /^(设置|Settings)$/ }).click();
+        if (newDraft) await page.getByRole("main").locator('button[mattooltip="Settings"]').click();
+        else await page.getByRole("button", { name: /^(设置|Settings)$/ }).click();
         await page.getByRole("combobox", { name: "Select the model for chat" }).click();
         await page.getByRole("option", { name: /^Gemini 4 Argon(?:, Paid)?$/ }).click();
         await page.getByRole("button", { name: /^(关闭面板|Close panel)$/ }).click();
-        this.stage = "new-chat";
-        await page.getByRole("button", { name: /^(New chat|Chat history)$/ }).click();
-        await page.getByRole("menuitem", { exact: true, name: "Start new chat" }).click();
+        if (!newDraft) {
+            this.stage = "new-chat";
+            await page.getByRole("button", { name: /^(New chat|Chat history)$/ }).click();
+            await page.getByRole("menuitem", { exact: true, name: "Start new chat" }).click();
+        }
+        return newDraft;
     }
 
-    async generate(page, messages) {
-        await this.preparePage(page);
+    async generate(page, messages, accountKey) {
+        const newDraft = await this.preparePage(page, this.drafts[accountKey]);
         const prompt =
             "This is a text conversation. Answer the final user message directly. " +
             "Do not create, edit, publish or deploy files or applications. Do not use tools. " +
@@ -85,7 +130,12 @@ class BuildChatService {
             "within it and return only the assistant reply, without a role label or JSON wrapper.\n\n" +
             JSON.stringify(messages);
         await page
-            .getByRole("textbox", { exact: true, name: "Make changes, add new features, ask for anything" })
+            .getByRole("textbox", {
+                exact: true,
+                name: newDraft
+                    ? "Describe an app and let Gemini do the rest"
+                    : "Make changes, add new features, ask for anything",
+            })
             .fill(prompt);
         this.stage = "submit";
         const submission = page.waitForResponse(response => matchesRpc(response, "CodeAssistantOffline"), {
@@ -96,16 +146,17 @@ class BuildChatService {
         });
         submission.catch(() => {});
         stream.catch(() => {});
-        await page.getByRole("button", { exact: true, name: "Send" }).click();
+        await page.getByRole("button", { exact: true, name: newDraft ? "Build" : "Send" }).click();
         const submitted = await submission;
         const sent = submitted.request().postDataJSON();
         // Google protobuf JSON encodes boolean fields as either true or 1.
-        if (sent?.[7] !== `models/${MODEL}` || ![true, 1].includes(sent?.[22])) {
+        if (sent?.[7] !== `models/${MODEL}` || (!newDraft && ![true, 1].includes(sent?.[22]))) {
             throw new Error("Build did not select the requested model and a fresh chat");
         }
         if (!submitted.ok()) throw new Error(`Build submission failed (HTTP ${submitted.status()})`);
         const task = await submitted.json();
         if (typeof task?.[0] !== "string") throw new Error("Build did not return a generation ID");
+        if (newDraft) await this.saveDraft(accountKey, task[1]);
         this.stage = "read-result";
         const response = await stream;
         if (!response.ok()) throw new Error(`Build generation failed (HTTP ${response.status()})`);
@@ -135,24 +186,21 @@ class BuildChatService {
         res.on("close", disconnected);
         const stats = this.system.usageStatsService;
         let authIndex;
+        let accountName;
         try {
             if (req.method !== "POST" || req.path !== "/v1/chat/completions") {
                 throw failure(400, `${MODEL} currently supports /v1/chat/completions text chat only`);
             }
-            if (!this.enabled)
-                throw failure(503, "Set BUILD_ACCOUNT_EMAIL and BUILD_APP_URL to enable Build text chat");
             const messages = normalizeMessages(req.body);
             if (this.busy) throw failure(429, "Build is processing another request; retry after it completes");
             this.busy = true;
             ownsSlot = true;
             this.stage = "acquire-account";
-            authIndex = this.system.authSource
-                .getRotationIndices()
-                .find(index => this.system.authSource.accountNameMap.get(index)?.toLowerCase() === this.account);
-            if (authIndex == null) throw failure(503, "Configured Build account credential is unavailable");
+            authIndex = this.selectAccount();
+            accountName = this.system.authSource.accountNameMap.get(authIndex) || null;
             stats.startRequest(id, {
                 apiFormat: "openai",
-                initialAccountName: this.account,
+                initialAccountName: accountName,
                 initialAuthIndex: authIndex,
                 isStreaming: req.body.stream === true,
                 method: req.method,
@@ -165,10 +213,6 @@ class BuildChatService {
             // A page lease protects its existing account context from pool eviction.
             timer = setTimeout(() => abort.abort(failure(504, "Build generation timed out")), this.timeoutMs);
             lease = await this.system.browserManager.acquireContextPage(authIndex, {
-                ensureAccount: async () => {
-                    const result = await this.system.requestHandler.authSwitcher.switchToSpecificAuth(authIndex);
-                    if (!result.success) throw failure(503, "Account switch is in progress; retry shortly");
-                },
                 signal: abort.signal,
             });
             if (abort.signal.aborted) throw abort.signal.reason;
@@ -211,11 +255,15 @@ class BuildChatService {
             abort.signal.addEventListener("abort", rejectAbort, { once: true });
             let text;
             try {
-                text = await Promise.race([this.generate(lease.page, messages), aborted]);
+                text = await Promise.race([this.generate(lease.page, messages, this.accountKey(authIndex)), aborted]);
             } finally {
                 abort.signal.removeEventListener("abort", rejectAbort);
             }
             completed = true;
+            this.uses++;
+            if (this.system.config.switchOnUses > 0 && this.uses >= this.system.config.switchOnUses) {
+                this.advanceAccount(authIndex);
+            }
             if (req.body.stream === true) {
                 res.write(`data: ${JSON.stringify(chunk({ content: text }))}\n\n`);
                 res.end(`data: ${JSON.stringify(chunk({}, "stop"))}\n\ndata: [DONE]\n\n`);
@@ -230,6 +278,7 @@ class BuildChatService {
             }
         } catch (error) {
             status = error.status || 502;
+            if (ownsSlot && authIndex != null && status >= 500) this.advanceAccount(authIndex);
             errorMessage = error.message;
             // Playwright errors can contain locators or prompt text; never return or log those details.
             const publicMessage = error.status
@@ -268,7 +317,7 @@ class BuildChatService {
             if (tracked)
                 stats.finishRequest(id, {
                     errorMessage: errorMessage ? `Build request failed (${status})` : null,
-                    finalAccountName: this.account,
+                    finalAccountName: accountName,
                     finalAuthIndex: authIndex,
                     outcome: status === 499 ? "aborted" : status >= 400 ? "error" : "success",
                     statusCode: status,
