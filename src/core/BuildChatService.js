@@ -137,7 +137,7 @@ class BuildChatService {
                     : "Make changes, add new features, ask for anything",
             })
             .fill(prompt);
-        this.stage = "submit";
+        this.stage = "click-submit";
         const submission = page.waitForResponse(response => matchesRpc(response, "CodeAssistantOffline"), {
             timeout: this.timeoutMs,
         });
@@ -146,7 +146,8 @@ class BuildChatService {
         });
         submission.catch(() => {});
         stream.catch(() => {});
-        await page.getByRole("button", { exact: true, name: newDraft ? "Build" : "Send" }).click();
+        await page.getByRole("button", { name: /^(Build|Send)$/ }).click();
+        this.stage = "await-submission";
         const submitted = await submission;
         const sent = submitted.request().postDataJSON();
         // Google protobuf JSON encodes boolean fields as either true or 1.
