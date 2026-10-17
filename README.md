@@ -1,5 +1,7 @@
 # Google AI Studio Build App to API Adapter
 
+本维护仓库在上游 v1.4.0 基础上，增加复用原浏览器的 Gemini 4 Argon 文本聊天通道。配置与限制见 [Build 文本聊天](docs/build-chat.md)。
+
 中文文档 | [English](README_EN.md)
 
 一个将 Google AI Studio Build App 网页端封装为兼容 OpenAI API、Gemini API 和 Anthropic API 的工具。该服务将充当代理，将 API 请求转换为与 AI Studio Build App 应用界面的浏览器交互。

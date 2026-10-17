@@ -65,6 +65,11 @@ class BrowserManager {
         this._onAuthQueuesDrained = null;
         this._isSystemBusyProvider = null;
         this.pendingContextClosures = new Map();
+        this.contextPageLeases = new Map();
+        this.closingContexts = new Map();
+        this.temporaryContexts = new Map();
+        this._contextCreationTail = Promise.resolve();
+        this._browserLaunchPromise = null;
 
         // Background wakeup service status (instance-level, tracks this.page)
         // Prevents multiple BackgroundWakeup instances from running simultaneously
@@ -174,6 +179,234 @@ class BrowserManager {
 
     setSystemBusyProvider(provider) {
         this._isSystemBusyProvider = typeof provider === "function" ? provider : null;
+    }
+
+    hasContextLease(authIndex) {
+        return (this.contextPageLeases.get(authIndex)?.size || 0) > 0;
+    }
+
+    async _awaitContextOperation(operation, signal) {
+        signal?.throwIfAborted();
+        if (!signal) return await operation;
+        let onAbort;
+        const aborted = new Promise((_, reject) => {
+            onAbort = () => reject(signal.reason || new Error("Context operation aborted"));
+            signal.addEventListener("abort", onAbort, { once: true });
+        });
+        try {
+            return await Promise.race([operation, aborted]);
+        } finally {
+            signal.removeEventListener("abort", onAbort);
+        }
+    }
+
+    async waitForContextLeases(authIndex, signal = null) {
+        while (this.hasContextLease(authIndex)) {
+            const leases = this.contextPageLeases.get(authIndex);
+            await this._awaitContextOperation(Promise.all([...leases].map(lease => lease.done)), signal);
+        }
+        signal?.throwIfAborted();
+    }
+
+    async _waitForAuthQueuesDrained(authIndex, signal) {
+        const registry = this.connectionRegistry;
+        if (!registry?.hasMessageQueueForAuth(authIndex)) return;
+        let onDrain;
+        const drained = new Promise(resolve => {
+            onDrain = index => {
+                if (index === authIndex && !registry.hasMessageQueueForAuth(authIndex)) resolve();
+            };
+            registry.on("authQueuesDrained", onDrain);
+            onDrain(authIndex);
+        });
+        try {
+            await this._awaitContextOperation(drained, signal);
+        } finally {
+            registry.off("authQueuesDrained", onDrain);
+        }
+    }
+
+    _serializeContextCreation(operation) {
+        const task = this._contextCreationTail.then(operation);
+        this._contextCreationTail = task.catch(() => {});
+        return task;
+    }
+
+    async _closeTemporaryContext(authIndex, data) {
+        if (this.temporaryContexts.get(authIndex) !== data) return;
+        if (this.hasContextLease(authIndex)) return;
+        if (data.closing) return await data.closing;
+        data.closing = (async () => {
+            try {
+                await this._updateAuthFile(authIndex);
+                await data.context.close();
+            } finally {
+                if (this.temporaryContexts.get(authIndex) === data) this.temporaryContexts.delete(authIndex);
+                data.resolveDone();
+            }
+        })();
+        return await data.closing;
+    }
+
+    async _getContextForAuxiliaryPage(authIndex, signal) {
+        // Stop speculative preloading before reserving capacity for an actual request.
+        await this._awaitContextOperation(this.abortBackgroundPreload(), signal);
+        for (;;) {
+            signal?.throwIfAborted();
+            const closing = this.closingContexts.get(authIndex);
+            if (closing) await this._awaitContextOperation(closing, signal);
+            const available = this.contexts.get(authIndex) || this.temporaryContexts.get(authIndex);
+            if (available && !this.initializingContexts.has(authIndex)) {
+                if (available.closing) {
+                    await this._awaitContextOperation(available.closing, signal);
+                    continue;
+                }
+                return available;
+            }
+            const result = await this._awaitContextOperation(
+                this._serializeContextCreation(async () => {
+                    signal?.throwIfAborted();
+                    const existing = this.contexts.get(authIndex) || this.temporaryContexts.get(authIndex);
+                    if (existing) return { data: existing };
+                    const capacity = this.config.maxContexts;
+                    while (capacity > 0 && this.contexts.size + this.temporaryContexts.size >= capacity) {
+                        const idle = [...this.contexts.keys()].find(index => !this._hasActiveQueueForAuth(index));
+                        if (idle === undefined) {
+                            return {
+                                temporary: [...this.temporaryContexts.values()],
+                                waitFor: [...this.contexts.keys()],
+                            };
+                        }
+                        if ((await this.closeContext(idle, { onlyIfIdle: true })) === false) {
+                            return { temporary: [], waitFor: [idle] };
+                        }
+                    }
+                    signal?.throwIfAborted();
+                    const storageState = this.authSource.getAuth(authIndex);
+                    if (!storageState) throw new Error(`Account #${authIndex} credential is unavailable`);
+                    await this._ensureBrowser();
+                    const proxy = this.stickyProxyManager.getProxyForAuth(authIndex)?.proxy || parseProxyFromEnv();
+                    let context;
+                    try {
+                        context = await this.browser.newContext({
+                            deviceScaleFactor: 1,
+                            storageState,
+                            viewport: { height: 1080, width: 1920 },
+                            ...(proxy ? { proxy } : {}),
+                        });
+                        await context.addInitScript(this._getPrivacyProtectionScript(authIndex));
+                        signal?.throwIfAborted();
+                        let resolveDone;
+                        const done = new Promise(resolve => {
+                            resolveDone = resolve;
+                        });
+                        const data = { context, done, resolveDone, temporary: true };
+                        this.temporaryContexts.set(authIndex, data);
+                        return { data };
+                    } catch (error) {
+                        if (context) await context.close().catch(() => {});
+                        throw error;
+                    }
+                }),
+                signal
+            );
+            if (result.data) return result.data;
+            // Do not hold the creation turn while waiting for in-flight native requests:
+            // they may need that turn themselves to complete an account-switch retry.
+            for (const index of result.waitFor) {
+                await this.waitForContextLeases(index, signal);
+                await this._waitForAuthQueuesDrained(index, signal);
+            }
+            if (result.temporary.length) {
+                await this._awaitContextOperation(Promise.race(result.temporary.map(data => data.done)), signal);
+            }
+        }
+    }
+
+    /**
+     * Borrow a page from the shared browser. Cold Build requests use a temporary
+     * storage-state context, without requiring the proxy app's WebSocket to start.
+     * The caller cancels upstream work before release(), including on disconnect.
+     */
+    async acquireContextPage(authIndex, { signal } = {}) {
+        if (!Number.isInteger(authIndex) || authIndex < 0) throw new Error("Invalid auth index");
+        let data;
+        try {
+            data = await this._getContextForAuxiliaryPage(authIndex, signal);
+            signal?.throwIfAborted();
+            if (this.closingContexts.has(authIndex) || data.closing) {
+                throw new Error(`Account #${authIndex} context is closing`);
+            }
+        } catch (error) {
+            if (data?.temporary) await this._closeTemporaryContext(authIndex, data);
+            throw error;
+        }
+        let leases = this.contextPageLeases.get(authIndex);
+        if (!leases) {
+            leases = new Set();
+            this.contextPageLeases.set(authIndex, leases);
+        }
+        let resolveDone;
+        const lease = {
+            done: new Promise(resolve => {
+                resolveDone = resolve;
+            }),
+            resolveDone: null,
+        };
+        lease.resolveDone = resolveDone;
+        leases.add(lease);
+        let page;
+        let releasePromise;
+        const closePage = async targetPage => {
+            if (!targetPage || targetPage.isClosed()) return;
+            let timeout;
+            try {
+                await Promise.race([
+                    targetPage.close(),
+                    new Promise((_, reject) => {
+                        timeout = setTimeout(() => reject(new Error("Auxiliary page close timed out")), 5000);
+                    }),
+                ]);
+            } catch (error) {
+                this.logger.warn(`[Browser] Auxiliary page close failed: ${error.message}`);
+            } finally {
+                clearTimeout(timeout);
+            }
+        };
+        const release = () => {
+            if (releasePromise) return releasePromise;
+            releasePromise = (async () => {
+                try {
+                    await closePage(page);
+                } finally {
+                    leases.delete(lease);
+                    if (leases.size === 0 && this.contextPageLeases.get(authIndex) === leases) {
+                        this.contextPageLeases.delete(authIndex);
+                    }
+                    resolveDone();
+                    if (data.temporary) {
+                        await this._closeTemporaryContext(authIndex, data).catch(error => {
+                            this.logger.warn(`[Browser] Temporary context close failed: ${error.message}`);
+                        });
+                    }
+                    this._closePendingContextIfIdle(authIndex).catch(error => {
+                        this.logger.warn(`[Browser] Deferred context close failed: ${error.message}`);
+                    });
+                }
+            })();
+            return releasePromise;
+        };
+        const creatingPage = data.context.newPage();
+        try {
+            page = await this._awaitContextOperation(creatingPage, signal);
+            signal?.throwIfAborted();
+            return { context: data.context, page, release };
+        } catch (error) {
+            // If acquisition was cancelled, a page created afterwards still needs closing.
+            if (!page) creatingPage.then(closePage).catch(() => {});
+            await release();
+            throw error;
+        }
     }
 
     _isSystemBusy() {
@@ -445,7 +678,7 @@ class BrowserManager {
      */
     async _updateAuthFile(authIndex) {
         // Retrieve the target account's context from the multi-context Map to avoid cross-contamination of auth data by using this.context
-        const contextData = this.contexts.get(authIndex);
+        const contextData = this.contexts.get(authIndex) || this.temporaryContexts.get(authIndex);
         if (!contextData || !contextData.context) return;
 
         // Check availability of auto-update feature from config
@@ -1432,7 +1665,9 @@ class BrowserManager {
         }
 
         if (firstReady === null) {
-            if (this.browser) await this.closeBrowser();
+            await this._serializeContextCreation(async () => {
+                if (this.browser && this.temporaryContexts.size === 0) await this.closeBrowser();
+            });
             return { firstReady: null };
         }
 
@@ -1482,7 +1717,17 @@ class BrowserManager {
      */
     async _ensureBrowser() {
         if (this.browser) return;
+        if (this._browserLaunchPromise) return await this._browserLaunchPromise;
+        const launching = this._launchBrowser();
+        this._browserLaunchPromise = launching;
+        try {
+            return await launching;
+        } finally {
+            if (this._browserLaunchPromise === launching) this._browserLaunchPromise = null;
+        }
+    }
 
+    async _launchBrowser() {
         const isStickyProxyEnabled = this.stickyProxyManager.isEnabled();
         const proxyConfig = isStickyProxyEnabled ? null : parseProxyFromEnv();
         if (isStickyProxyEnabled) {
@@ -1568,6 +1813,7 @@ class BrowserManager {
     }
 
     _hasActiveQueueForAuth(authIndex) {
+        if (this.hasContextLease(authIndex)) return true;
         if (this.connectionRegistry?.hasMessageQueueForAuth) {
             return this.connectionRegistry.hasMessageQueueForAuth(authIndex);
         }
@@ -1607,7 +1853,9 @@ class BrowserManager {
         }
 
         this.pendingContextClosures.delete(authIndex);
-        await this.closeContext(authIndex);
+        if ((await this.closeContext(authIndex, { onlyIfIdle: true })) === false) {
+            return this._scheduleContextClosureWhenIdle(authIndex, reason);
+        }
         return true;
     }
 
@@ -1704,7 +1952,7 @@ class BrowserManager {
             }
 
             // Check pool size limit
-            if (maxPoolSize > 0 && this.contexts.size >= maxPoolSize) {
+            if (maxPoolSize > 0 && this.contexts.size + this.temporaryContexts.size >= maxPoolSize) {
                 this.logger.info(`[ContextPool] Pool size limit reached, stopping preload`);
                 break;
             }
@@ -1753,6 +2001,14 @@ class BrowserManager {
     async preCleanupForSwitch(targetAuthIndex) {
         const maxContexts = this.config.maxContexts;
         const isUnlimited = maxContexts === 0;
+
+        // Auxiliary tasks retain their account until their page is released. Do not
+        // create a replacement context alongside a leased one on memory-limited hosts.
+        if (maxContexts === 1 && !this.contexts.has(targetAuthIndex)) {
+            for (const index of this.contextPageLeases.keys()) {
+                await this.waitForContextLeases(index);
+            }
+        }
 
         // Abort any ongoing background preload task before cleanup
         // This prevents race conditions where background tasks continue initializing contexts
@@ -2007,7 +2263,7 @@ class BrowserManager {
         }
 
         // Preload candidates if ready and initializing contexts still leave room in the pool
-        const poolOccupancy = this.contexts.size + this.initializingContexts.size;
+        const poolOccupancy = this.contexts.size + this.initializingContexts.size + this.temporaryContexts.size;
         if (candidates.length > 0 && (isUnlimited || poolOccupancy < maxContexts)) {
             this._preloadBackgroundContexts(candidates, isUnlimited ? 0 : maxContexts);
         }
@@ -2036,6 +2292,28 @@ class BrowserManager {
      * @returns {Promise<{context, page}>}
      */
     async _initializeContext(authIndex, isBackgroundTask = false) {
+        return await this._serializeContextCreation(async () => {
+            try {
+                const capacity = this.config.maxContexts;
+                while (
+                    capacity > 0 &&
+                    this.temporaryContexts.size > 0 &&
+                    this.contexts.size + this.temporaryContexts.size >= capacity
+                ) {
+                    this._throwIfContextInitAborted(authIndex, isBackgroundTask);
+                    await Promise.race([...this.temporaryContexts.values()].map(data => data.done));
+                }
+                this._throwIfContextInitAborted(authIndex, isBackgroundTask);
+                await this._ensureBrowser();
+                return await this._initializeContextNow(authIndex, isBackgroundTask);
+            } finally {
+                this.initializingContexts.delete(authIndex);
+                this.abortedContexts.delete(authIndex);
+            }
+        });
+    }
+
+    async _initializeContextNow(authIndex, isBackgroundTask = false) {
         let context = null;
         let page = null;
 
@@ -2586,7 +2864,24 @@ class BrowserManager {
      *
      * @param {number} authIndex - The auth index to close
      */
-    async closeContext(authIndex) {
+    async closeContext(authIndex, { onlyIfIdle = false } = {}) {
+        const existing = this.closingContexts.get(authIndex);
+        if (existing) return await existing;
+        const closing = (async () => {
+            await this.waitForContextLeases(authIndex);
+            if (onlyIfIdle && this._hasActiveQueueForAuth(authIndex)) return false;
+            await this._closeContextNow(authIndex);
+            return true;
+        })();
+        this.closingContexts.set(authIndex, closing);
+        try {
+            return await closing;
+        } finally {
+            if (this.closingContexts.get(authIndex) === closing) this.closingContexts.delete(authIndex);
+        }
+    }
+
+    async _closeContextNow(authIndex) {
         this.pendingContextClosures.delete(authIndex);
 
         // If context is being initialized in background, signal abort and wait
@@ -2601,7 +2896,12 @@ class BrowserManager {
             // Context doesn't exist (was never initialized or was aborted)
             // Still check if we need to close the browser
             // Only close if there are no contexts AND no contexts being initialized
-            if (this.contexts.size === 0 && this.initializingContexts.size === 0 && this.browser) {
+            if (
+                this.contexts.size === 0 &&
+                this.temporaryContexts.size === 0 &&
+                this.initializingContexts.size === 0 &&
+                this.browser
+            ) {
                 this.logger.info(`[Browser] All contexts closed, closing browser instance...`);
                 await this.closeBrowser();
             }
@@ -2658,7 +2958,12 @@ class BrowserManager {
         // If this was the last context, close the browser to free resources
         // This ensures a clean state when all accounts are deleted
         // Only close if there are no contexts AND no contexts being initialized
-        if (this.contexts.size === 0 && this.initializingContexts.size === 0 && this.browser) {
+        if (
+            this.contexts.size === 0 &&
+            this.temporaryContexts.size === 0 &&
+            this.initializingContexts.size === 0 &&
+            this.browser
+        ) {
             this.logger.info(`[Browser] All contexts closed, closing browser instance...`);
             await this.closeBrowser();
         }
@@ -2677,6 +2982,14 @@ class BrowserManager {
                 this.logger.info(`[Browser] Stopped health monitor for context #${authIndex}`);
             }
         }
+
+        // A browser crash or shutdown also ends auxiliary work and unblocks waiters.
+        for (const leases of this.contextPageLeases.values()) {
+            for (const lease of leases) lease.resolveDone();
+        }
+        this.contextPageLeases.clear();
+        for (const data of this.temporaryContexts.values()) data.resolveDone();
+        this.temporaryContexts.clear();
 
         // Reset all references
         this.contexts.clear();

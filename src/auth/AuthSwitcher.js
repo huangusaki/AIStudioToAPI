@@ -50,6 +50,7 @@ class AuthSwitcher {
     // }
 
     async switchToNextAuth() {
+        await this.browserManager.waitForContextLeases(this.currentAuthIndex);
         const available = this.authSource.getRotationIndices();
 
         if (available.length === 0) {
@@ -209,6 +210,7 @@ class AuthSwitcher {
     }
 
     async switchToSpecificAuth(targetIndex) {
+        await this.browserManager.waitForContextLeases(this.currentAuthIndex);
         if (this.isSystemBusy) {
             this.logger.info("🔄 [Auth] Account switching in progress, skipping duplicate operation");
             return { reason: "Switch already in progress.", success: false };

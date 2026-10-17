@@ -18,6 +18,7 @@ const { URL } = require("url");
 const LoggingService = require("../utils/LoggingService");
 const AuthSource = require("../auth/AuthSource");
 const BrowserManager = require("./BrowserManager");
+const { BuildChatService, MODEL: BUILD_MODEL } = require("./BuildChatService");
 const ConnectionRegistry = require("./ConnectionRegistry");
 const RequestHandler = require("./RequestHandler");
 const UsageStatsService = require("./UsageStatsService");
@@ -100,28 +101,30 @@ class ProxyServerSystem extends EventEmitter {
         this.browserManager.setConnectionRegistry(this.connectionRegistry);
 
         // index.js mounts the request/response modules onto this instance's prototype at runtime.
-        this.requestHandler = /** @type {RequestHandler &
-         * import("./RequestHandler/ConnectionHandler") &
-         * import("./RequestHandler/RetryHandler") &
-         * import("./RequestHandler/GeminiHandler") &
-         * import("./RequestHandler/EmbeddingsHandler") &
-         * import("./RequestHandler/UploadHandler") &
-         * import("./RequestHandler/ChatCompletionsHandler") &
-         * import("./RequestHandler/ResponsesHandler") &
-         * import("./RequestHandler/ClaudeHandler") &
-         * import("./RequestHandler/ErrorHandler") &
-         * import("./RequestHandler/TransportHandler")}
-         */ (
-            new RequestHandler(
-                this,
-                this.connectionRegistry,
-                this.logger,
-                this.browserManager,
-                this.config,
-                this.authSource
-            )
-        );
+        this.requestHandler =
+            /** @type {RequestHandler &
+             * import("./RequestHandler/ConnectionHandler") &
+             * import("./RequestHandler/RetryHandler") &
+             * import("./RequestHandler/GeminiHandler") &
+             * import("./RequestHandler/EmbeddingsHandler") &
+             * import("./RequestHandler/UploadHandler") &
+             * import("./RequestHandler/ChatCompletionsHandler") &
+             * import("./RequestHandler/ResponsesHandler") &
+             * import("./RequestHandler/ClaudeHandler") &
+             * import("./RequestHandler/ErrorHandler") &
+             * import("./RequestHandler/TransportHandler")}
+             */ (
+                new RequestHandler(
+                    this,
+                    this.connectionRegistry,
+                    this.logger,
+                    this.browserManager,
+                    this.config,
+                    this.authSource
+                )
+            );
         this.browserManager.setSystemBusyProvider(() => this.requestHandler?.isSystemBusy === true);
+        this.buildChatService = new BuildChatService(this);
 
         this.httpServer = null;
         this.wsServer = null;
@@ -474,6 +477,15 @@ class ProxyServerSystem extends EventEmitter {
         // API authentication middleware
         app.use(this._createAuthMiddleware());
 
+        app.use((req, res, next) => {
+            if (!this.buildChatService.matches(req)) return next();
+            this.buildChatService.handle(req, res).catch(error => {
+                this.logger.error(`[Build] Cleanup failed (${error.name})`);
+                if (!res.headersSent) res.status(500).json({ error: { message: "Build request cleanup failed" } });
+                else if (!res.writableEnded) res.end();
+            });
+        });
+
         // API routes
         app.get(["/v1/models"], (req, res) => {
             // OpenAI format
@@ -485,6 +497,14 @@ class ProxyServerSystem extends EventEmitter {
                 object: "model",
                 owned_by: "google",
             }));
+            if (this.buildChatService.enabled) {
+                models.push({
+                    created: Math.floor(Date.now() / 1000),
+                    id: BUILD_MODEL,
+                    object: "model",
+                    owned_by: "google",
+                });
+            }
 
             res.status(200).json({
                 data: models,
