@@ -99,7 +99,8 @@ class BuildChatService {
         await page.getByRole("button", { exact: true, name: "Send" }).click();
         const submitted = await submission;
         const sent = submitted.request().postDataJSON();
-        if (sent?.[7] !== `models/${MODEL}` || sent?.[22] !== true) {
+        // Google protobuf JSON encodes boolean fields as either true or 1.
+        if (sent?.[7] !== `models/${MODEL}` || ![true, 1].includes(sent?.[22])) {
             throw new Error("Build did not select the requested model and a fresh chat");
         }
         if (!submitted.ok()) throw new Error(`Build submission failed (HTTP ${submitted.status()})`);
