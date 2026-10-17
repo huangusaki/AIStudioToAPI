@@ -20,6 +20,7 @@ class ConfigLoader {
 
     loadConfiguration() {
         const config = {
+            aiStudioAppUrl: "https://ai.studio/apps/56128c84-c8e6-4d52-bf94-934c836720d9",
             apiKeys: [],
             apiKeySource: "Not set",
             browserExecutablePath: null,
@@ -46,6 +47,13 @@ class ConfigLoader {
         };
 
         // Environment variable overrides
+        if (process.env.AI_STUDIO_APP_URL) {
+            const appUrl = process.env.AI_STUDIO_APP_URL.trim();
+            if (!/^https:\/\/ai\.studio\/apps\/[a-zA-Z0-9-]+\/?$/.test(appUrl)) {
+                throw new Error("AI_STUDIO_APP_URL must be https://ai.studio/apps/<app-id>");
+            }
+            config.aiStudioAppUrl = appUrl;
+        }
         if (process.env.PORT) {
             const parsed = parseInt(process.env.PORT, 10);
             config.httpPort = Number.isFinite(parsed) ? parsed : config.httpPort;

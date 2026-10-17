@@ -145,9 +145,9 @@ class BuildChatService {
             this.busy = true;
             ownsSlot = true;
             this.stage = "acquire-account";
-            authIndex = this.system.authSource.availableIndices.find(
-                index => this.system.authSource.accountNameMap.get(index)?.toLowerCase() === this.account
-            );
+            authIndex = this.system.authSource
+                .getRotationIndices()
+                .find(index => this.system.authSource.accountNameMap.get(index)?.toLowerCase() === this.account);
             if (authIndex == null) throw failure(503, "Configured Build account credential is unavailable");
             stats.startRequest(id, {
                 apiFormat: "openai",
