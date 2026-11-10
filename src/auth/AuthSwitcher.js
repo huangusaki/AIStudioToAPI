@@ -50,7 +50,6 @@ class AuthSwitcher {
     // }
 
     async switchToNextAuth() {
-        await this.browserManager.waitForContextLeases(this.currentAuthIndex);
         const available = this.authSource.getRotationIndices();
 
         if (available.length === 0) {
@@ -65,6 +64,7 @@ class AuthSwitcher {
         this.isSystemBusy = true;
 
         try {
+            await this.browserManager.waitForContextLeases(this.currentAuthIndex);
             // Single account mode
             if (available.length === 1) {
                 const singleIndex = available[0];
@@ -210,7 +210,6 @@ class AuthSwitcher {
     }
 
     async switchToSpecificAuth(targetIndex) {
-        await this.browserManager.waitForContextLeases(this.currentAuthIndex);
         if (this.isSystemBusy) {
             this.logger.info("🔄 [Auth] Account switching in progress, skipping duplicate operation");
             return { reason: "Switch already in progress.", success: false };
@@ -227,6 +226,7 @@ class AuthSwitcher {
 
         this.isSystemBusy = true;
         try {
+            await this.browserManager.waitForContextLeases(this.currentAuthIndex);
             this.logger.info(`🔄 [Auth] Starting switch to specified account #${targetIndex}...`);
             // Pre-cleanup: remove excess contexts BEFORE creating new one to avoid exceeding maxContexts
             await this.browserManager.preCleanupForSwitch(targetIndex);

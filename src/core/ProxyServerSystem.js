@@ -18,7 +18,7 @@ const { URL } = require("url");
 const LoggingService = require("../utils/LoggingService");
 const AuthSource = require("../auth/AuthSource");
 const BrowserManager = require("./BrowserManager");
-const { BuildChatService, MODEL: BUILD_MODEL } = require("./BuildChatService");
+const { BuildChatService, MODELS: BUILD_MODELS } = require("./BuildChatService");
 const ConnectionRegistry = require("./ConnectionRegistry");
 const RequestHandler = require("./RequestHandler");
 const UsageStatsService = require("./UsageStatsService");
@@ -498,12 +498,14 @@ class ProxyServerSystem extends EventEmitter {
                 owned_by: "google",
             }));
             if (this.buildChatService.enabled) {
-                models.push({
-                    created: Math.floor(Date.now() / 1000),
-                    id: BUILD_MODEL,
-                    object: "model",
-                    owned_by: "google",
-                });
+                models.push(
+                    ...Object.keys(BUILD_MODELS).map(id => ({
+                        created: Math.floor(Date.now() / 1000),
+                        id,
+                        object: "model",
+                        owned_by: "google",
+                    }))
+                );
             }
 
             res.status(200).json({

@@ -1,10 +1,28 @@
 // Build returns cumulative snapshots. Only completed model text is an API answer.
 function extractSnapshots(response) {
+    const failRpc = code => {
+        const statuses = {
+            3: 400,
+            4: 504,
+            5: 404,
+            7: 403,
+            8: 429,
+            9: 400,
+            10: 409,
+            11: 400,
+            12: 501,
+            13: 500,
+            14: 503,
+            16: 401,
+        };
+        const status = statuses[code] || (code >= 400 && code <= 599 ? code : 502);
+        throw Object.assign(new Error(`Build RPC failed (${code})`), { status });
+    };
     const rpcError = value => {
         if (Array.isArray(value) && typeof value[0] === "number" && typeof value[1] === "string") {
-            throw new Error(`Build RPC failed (${value[0]})`);
+            failRpc(value[0]);
         }
-        if (value?.error) throw new Error(`Build RPC failed (${value.error.code || "unknown"})`);
+        if (value?.error) failRpc(value.error.code || "unknown");
     };
     rpcError(response);
     if (!Array.isArray(response) || response.length !== 1 || !Array.isArray(response[0])) {
